@@ -876,6 +876,8 @@ struct battery_chg_dev {
 	bool				read_capacity_timeout;
 	int				thermal_board_temp;
 	int				thermal_scene;
+	int				bypass_state;
+	struct delayed_work		bypass_work;
 	struct				notifier_block chg_nb;
 	bool				error_prop;
 	bool				micro_usb;
@@ -3964,6 +3966,97 @@ static ssize_t fastcharge_enable_show(struct class *c,
 }
 
 static CLASS_ATTR_RW(fastcharge_enable);
+
+enum {
+	BYPASS_OFF = 0,
+	BYPASS_ON = 1,
+	BYPASS_PENDING_OFF = 2,
+	BYPASS_PENDING_ON = 3,
+};
+
+static void bypass_transition_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev =
+		container_of(work, struct battery_chg_dev, bypass_work.work);
+	struct psy_state *pst_xm = &bcdev->psy_list[PSY_TYPE_XM];
+	struct psy_state *pst_batt = &bcdev->psy_list[PSY_TYPE_BATTERY];
+
+	if (bcdev->bypass_state == BYPASS_PENDING_ON) {
+		/* Step 1: Step down fastcharge first to stabilize power rail */
+		write_property_id(bcdev, pst_xm, XM_PROP_SPORT_MODE, 0);
+		write_property_id(bcdev, pst_xm, XM_PROP_SMART_CHG, 0x8);
+		msleep(300);
+
+		/* Step 2: Engage hardware bypass via Qualcomm PMIC charge isolation */
+		write_property_id(bcdev, pst_batt, BATT_CHG_CTRL_EN, 1);
+		bcdev->chg_ctrl_en = 1;
+
+		bcdev->bypass_state = BYPASS_ON;
+		pr_info("bypass_charging: transitioned to ON (hardware bypass active)\n");
+	} else if (bcdev->bypass_state == BYPASS_PENDING_OFF) {
+		/* Step 1: Re-enable battery charging */
+		write_property_id(bcdev, pst_batt, BATT_CHG_CTRL_EN, 0);
+		bcdev->chg_ctrl_en = 0;
+		msleep(300);
+
+		/* Step 2: Restore normal charging profile */
+		write_property_id(bcdev, pst_xm, XM_PROP_SMART_CHG, 0x9);
+
+		bcdev->bypass_state = BYPASS_OFF;
+		pr_info("bypass_charging: transitioned to OFF (normal charging restored)\n");
+	}
+
+	if (pst_batt->psy)
+		power_supply_changed(pst_batt->psy);
+}
+
+static ssize_t bypass_charging_enable_show(struct class *c,
+					struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev =
+		container_of(c, struct battery_chg_dev, battery_class);
+
+	switch (bcdev->bypass_state) {
+	case BYPASS_ON:
+		return scnprintf(buf, PAGE_SIZE, "1\n");
+	case BYPASS_OFF:
+		return scnprintf(buf, PAGE_SIZE, "0\n");
+	case BYPASS_PENDING_ON:
+		return scnprintf(buf, PAGE_SIZE, "1-pending\n");
+	case BYPASS_PENDING_OFF:
+		return scnprintf(buf, PAGE_SIZE, "0-pending\n");
+	default:
+		return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->chg_ctrl_en ? 1 : 0);
+	}
+}
+
+static ssize_t bypass_charging_enable_store(struct class *c,
+					struct class_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev =
+		container_of(c, struct battery_chg_dev, battery_class);
+	int enable;
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	/* Prevent re-triggering while a transition is in-flight */
+	if (bcdev->bypass_state == BYPASS_PENDING_ON ||
+	    bcdev->bypass_state == BYPASS_PENDING_OFF)
+		return -EBUSY;
+
+	if (enable && (bcdev->bypass_state == BYPASS_OFF || !bcdev->chg_ctrl_en)) {
+		bcdev->bypass_state = BYPASS_PENDING_ON;
+		schedule_delayed_work(&bcdev->bypass_work, msecs_to_jiffies(50));
+	} else if (!enable && (bcdev->bypass_state == BYPASS_ON || bcdev->chg_ctrl_en)) {
+		bcdev->bypass_state = BYPASS_PENDING_OFF;
+		schedule_delayed_work(&bcdev->bypass_work, msecs_to_jiffies(50));
+	}
+
+	return count;
+}
+static CLASS_ATTR_RW(bypass_charging_enable);
 
 QTI_CHARGER_RO_SHOW(usb_typec_compliant, PSY_TYPE_USB, USB_TYPEC_COMPLIANT);
 
@@ -10330,6 +10423,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_reverse_quick_charge.attr,
 	&class_attr_last_node.attr,
 	&class_attr_fastcharge_enable.attr,
+	&class_attr_bypass_charging_enable.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class);
@@ -10359,6 +10453,7 @@ static struct attribute *battery_class_usb_2_attrs[] = {
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
 	&class_attr_fastcharge_enable.attr,
+	&class_attr_bypass_charging_enable.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_usb_2);
@@ -10376,6 +10471,7 @@ static struct attribute *battery_class_no_wls_attrs[] = {
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_usb_num_ports.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charging_enable.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_no_wls);
@@ -10397,6 +10493,7 @@ static struct attribute *battery_class_usb_2_no_wls_attrs[] = {
 	&class_attr_usb_num_ports.attr,
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charging_enable.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_usb_2_no_wls);
@@ -11145,6 +11242,8 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK( &bcdev->xm_prop_change_work, generate_xm_charge_uvent);
 	INIT_DELAYED_WORK( &bcdev->xm_smart_prop_update_work, generate_xm_smartchg_uvent);
 	INIT_DELAYED_WORK( &bcdev->batt_update_work, xm_batt_update_work);
+	bcdev->bypass_state = 0;
+	INIT_DELAYED_WORK(&bcdev->bypass_work, bypass_transition_work);
 	INIT_DELAYED_WORK( &bcdev->glink_crash_num_work, xm_glink_crash_num_work);
 #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
 	INIT_DELAYED_WORK(&bcdev->panel_notify_register_work, battery_register_panel_notifier_work);
